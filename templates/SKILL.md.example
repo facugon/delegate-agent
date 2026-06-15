@@ -32,9 +32,10 @@ Sistema local para delegar trabajo a Gemini en background, dentro de un containe
 Todos se invocan desde la raíz del proyecto (donde está `delegate.config.json`):
 
 ```bash
-# Lanzar job (devuelve id inmediatamente, ~1s)
-delegate run gemini "<prompt>" \
+# Lanzar job (devuelve id inmediatamente, ~1s). Agente: claude | gemini
+delegate run claude "<prompt>" \
     [--repo <key>] \                 # claves definidas en delegate.config.json
+    [--model <id>] \                 # override del modelo del agente
     [--prompt-file <path>] \         # prompt desde archivo (para prompts largos)
     [--timeout <minutos>]            # default: 30, máximo recomendado 60
 

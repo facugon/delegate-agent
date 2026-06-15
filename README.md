@@ -1,6 +1,6 @@
 # delegate — local agent sandbox orchestrator
 
-Orquestador local para delegar tareas a agentes LLM (hoy: Gemini CLI) en background, con sandbox Docker, trazabilidad completa, y review humano antes de mergear nada.
+Orquestador local para delegar tareas a agentes LLM (**Claude Code** y **Gemini CLI**) en background, con sandbox Docker, trazabilidad completa, y review humano antes de mergear nada.
 
 **No es un servicio. No tiene API HTTP. No usa DB.** Es un script Node + Docker + filesystem. Pensado para uso individual (vos + tu agente principal trabajando juntos), no para multi-tenancy.
 
@@ -39,8 +39,10 @@ Cuando trabajás con un agente principal en una sesión interactiva (Claude Code
 
 - **Docker** (cualquier versión moderna, sin daemon especial)
 - **Node 18+**
-- **Gemini CLI autenticado en host**: `npm install -g @google/gemini-cli` y correr `gemini` interactivo una vez para el OAuth login. Esto crea `~/.gemini/oauth_creds.json`, que se copia al container por job.
 - **Git ≥ 2.30** (para `git clone --local --no-hardlinks`)
+- **Auth del agente que vayas a usar** (una de dos opciones por agente):
+  - **OAuth en host** (modo `oauth-dir`, default): el agente autenticado en tu host. Para Claude Code, `claude` logueado (token en `~/.claude/.credentials.json`); para Gemini, `gemini` logueado (`~/.gemini/oauth_creds.json`). El tool copia esas creds al container por job — el original nunca se monta.
+  - **API key** (modo `api-key`): seteás una env var (`ANTHROPIC_API_KEY` / `GEMINI_API_KEY`) y delegate la inyecta al container. Arranque inmediato, sin OAuth interactivo. La key **no se persiste** en disco.
 
 Opcional: `notify-send` (Linux) para notificación desktop al terminar un job.
 
@@ -100,7 +102,7 @@ Esto crea `delegate.config.json` y `.delegate/sandbox.env` a partir de los templ
    ```
 5. Probá:
    ```bash
-   delegate run gemini "decime hola" --timeout 2
+   delegate run claude "decime hola" --timeout 2
    ```
 
 ### 3. (Opcional) Skill para Claude Code
@@ -109,12 +111,23 @@ Si usás Claude Code, copiá `templates/SKILL.md.example` a `.claude/skills/dele
 
 ---
 
+## Agentes
+
+| Agente | Comando | Estado | Auth por defecto |
+|---|---|---|---|
+| **Claude Code** | `delegate run claude "..."` | ✅ estable, recomendado | OAuth `~/.claude/.credentials.json` o `ANTHROPIC_API_KEY` |
+| **Gemini CLI** | `delegate run gemini "..."` | ⚠️ Google lo retira el **2026-06-18** | OAuth `~/.gemini` o `GEMINI_API_KEY` |
+| Antigravity CLI (`agy`) | — | 🔜 a sumar (reemplazo de Gemini) cuando sus flags headless estén confirmadas | — |
+
+El default está en `defaultAgent` del config. Pineá el modelo con `--model` o en `config.agents.<agente>.model` (ej. para Claude conviene un modelo más barato que el default de tu plan en tareas delegadas).
+
 ## Uso
 
 ```bash
 # Lanzar
-delegate run gemini "<prompt>" \
+delegate run <agente> "<prompt>" \         # agente: claude | gemini
     [--repo <key>]              # default: workspace (claves del config)
+    [--model <id>]              # override del modelo del agente
     [--prompt-file <path>]      # prompt desde archivo (para prompts largos)
     [--timeout <minutos>]       # default: 30
 
@@ -283,7 +296,7 @@ delegate-agent/                  # este repo (el tool)
 
 ## Limitaciones actuales
 
-1. **Solo Gemini.** La arquitectura es agent-agnóstica pero agregar otro agente requiere sumar el binario al Dockerfile y un handler de auth.
+1. **Dos agentes (claude, gemini).** Sumar otro = una entrada en el registry `AGENTS` (binario, args headless, auth, parser de stream-json) + instalar el CLI en el Dockerfile. Antigravity CLI está pendiente de confirmar sus flags reales.
 2. **Sin auto-cleanup.** Jobs viejos quedan en `<jobsDir>/`; cada clone puede pesar 10-100MB.
 3. **Sin retry automático** en caso de cuota.
 4. **No hay continuación de sesión** (`--resume`) expuesta todavía.

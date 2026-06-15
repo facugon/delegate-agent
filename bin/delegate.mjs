@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // delegate.mjs — Orquestador local de agentes en sandbox Docker.
-// MVP: Gemini-only, clone-aislado, branch local sin remote, traceability completa.
 //
-// Este binario es genérico: NO sabe nada del proyecto que lo usa. Toda la
-// configuración (repos, imagen Docker, env sandbox) vive en un
-// `delegate.config.json` ubicado en la raíz del proyecto target. El binario lo
-// descubre subiendo desde el CWD.
+// Multi-agente vía un registry de "adapters" (AGENTS): cada agente define cómo
+// se invoca headless, cómo se prepara su auth, y cómo se parsea su stream-json.
+// Hoy: gemini y claude (code). El core es agnóstico al proyecto: toda la config
+// (repos, imagen, env sandbox, overrides de agente/auth) vive en
+// `delegate.config.json` en la raíz del proyecto target, que el binario descubre
+// subiendo desde el CWD.
 
 import { spawn, spawnSync } from 'node:child_process';
 import {
@@ -27,27 +28,141 @@ const TOOL_DOCKER_DIR = join(TOOL_ROOT, 'docker');
 
 const CONFIG_FILENAME = 'delegate.config.json';
 
-// Defaults para campos opcionales del config.
 const CONFIG_DEFAULTS = {
   dockerImage: 'delegate-agent:latest',
   containerPrefix: 'delegate',
   gitIdentityDomain: 'delegate.local',
   sandboxEnv: '.delegate/sandbox.env',
   jobsDir: '.delegate/jobs',
+  defaultAgent: 'claude',
   repos: { workspace: '.' },
+  agents: {},
 };
 
-const GEMINI_AUTH_FILES = [
-  'oauth_creds.json',
-  'google_accounts.json',
-  'projects.json',
-  'settings.json',
-  'installation_id',
-];
+// ---------- agent adapters ----------
+//
+// Cada adapter define:
+//   label       nombre del binario (para mostrar)
+//   defaultModel (string|null) modelo si no se pasa --model ni config
+//   extraEnv    env vars extra para el container (['NAME=val'])
+//   auth        descriptor de auth por defecto (overridable por config):
+//                 mode 'oauth-dir': { dirs:[{ target, copies:[hostPath], synth:[{name,content}] }] }
+//                   Se montan DIRECTORIOS (no archivos sueltos): los CLIs hacen
+//                   escritura atómica (write-tmp + rename), que falla con EBUSY
+//                   sobre un bind-mount de archivo. Montar el dir lo permite.
+//                 mode 'api-key':   { env:'NAME', fromHostEnv:true }
+//   buildCmd({promptText, model}) → argv del CLI (después del nombre de imagen)
+//   handleEvent(evt, m, ctx) muta meta `m` y el contexto acumulador `ctx`
+//   finalText(ctx) → texto final del agente (para output.md)
+
+const AGENTS = {
+  gemini: {
+    label: 'gemini',
+    defaultModel: null,
+    extraEnv: ['GEMINI_CLI_TRUST_WORKSPACE=true'],
+    auth: {
+      mode: 'oauth-dir',
+      dirs: [{
+        target: '/home/node/.gemini',
+        copies: [
+          'oauth_creds.json', 'google_accounts.json', 'projects.json',
+          'settings.json', 'installation_id',
+        ].map((f) => `~/.gemini/${f}`),
+        synth: [],
+      }],
+    },
+    buildCmd({ promptText, model }) {
+      return [
+        'gemini', '--skip-trust', '--yolo',
+        '--output-format', 'stream-json',
+        ...(model ? ['-m', model] : []),
+        '-p', promptText,
+      ];
+    },
+    handleEvent(evt, m, ctx) {
+      if (evt.type === 'init') {
+        m.session_id = evt.session_id || null;
+        m.model = evt.model || m.model || null;
+      } else if (evt.type === 'message') {
+        m.events.messages = (m.events.messages || 0) + 1;
+        if (evt.role === 'assistant' && typeof evt.content === 'string') {
+          ctx.assistantText += evt.content;
+        }
+      } else if (evt.type === 'tool_call' || evt.type === 'tool_use') {
+        m.events.tool_calls = (m.events.tool_calls || 0) + 1;
+      } else if (evt.type === 'error') {
+        m.events.errors = (m.events.errors || 0) + 1;
+      } else if (evt.type === 'result') {
+        const s = evt.stats || {};
+        m.tokens = {
+          input: s.input_tokens ?? s.input ?? 0,
+          output: s.output_tokens ?? 0,
+          cached: s.cached ?? 0,
+          total: s.total_tokens ?? 0,
+        };
+        if (typeof s.tool_calls === 'number') m.events.tool_calls = s.tool_calls;
+        m.result_status = evt.status || null;
+      }
+    },
+    finalText(ctx) { return ctx.assistantText; },
+  },
+
+  claude: {
+    label: 'claude',
+    defaultModel: null,
+    extraEnv: [],
+    auth: {
+      mode: 'oauth-dir',
+      // Token OAuth de la subscripción. El resto (~/.claude/*) queda local al container.
+      // ~/.claude.json (config mínima de onboarding) está horneado en la imagen.
+      dirs: [{
+        target: '/home/node/.claude',
+        copies: ['~/.claude/.credentials.json'],
+        synth: [],
+      }],
+    },
+    buildCmd({ promptText, model }) {
+      return [
+        'claude', '-p', promptText,
+        '--output-format', 'stream-json',
+        '--verbose',
+        '--dangerously-skip-permissions',
+        '--strict-mcp-config', // no cargar MCP servers del host
+        ...(model ? ['--model', model] : []),
+      ];
+    },
+    handleEvent(evt, m, ctx) {
+      if (evt.type === 'system' && evt.subtype === 'init') {
+        m.session_id = evt.session_id || m.session_id || null;
+        m.model = evt.model || m.model || null;
+      } else if (evt.type === 'assistant') {
+        m.events.messages = (m.events.messages || 0) + 1;
+        const content = evt.message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block?.type === 'tool_use') m.events.tool_calls = (m.events.tool_calls || 0) + 1;
+          }
+        }
+      } else if (evt.type === 'result') {
+        const u = evt.usage || {};
+        const input = u.input_tokens ?? 0;
+        const output = u.output_tokens ?? 0;
+        const cached = u.cache_read_input_tokens ?? 0;
+        const cacheCreate = u.cache_creation_input_tokens ?? 0;
+        m.tokens = { input, output, cached, total: input + output + cached + cacheCreate };
+        m.result_status = evt.subtype || null;
+        if (evt.is_error) m.events.errors = (m.events.errors || 0) + 1;
+        if (typeof evt.session_id === 'string') m.session_id = evt.session_id;
+        if (typeof evt.result === 'string') ctx.resultText = evt.result;
+        if (typeof evt.total_cost_usd === 'number') m.cost_usd = evt.total_cost_usd;
+      }
+    },
+    finalText(ctx) { return ctx.resultText || ctx.assistantText; },
+  },
+};
 
 // ---------- config ----------
 
-// Sube desde `start` buscando delegate.config.json. Devuelve el dir que lo contiene.
 function findProjectRoot(start = process.cwd()) {
   let dir = resolve(start);
   while (true) {
@@ -58,8 +173,6 @@ function findProjectRoot(start = process.cwd()) {
   }
 }
 
-// Carga y resuelve la config. Sale con error claro si no la encuentra.
-// Devuelve un objeto con todo ya resuelto a paths absolutos.
 function loadConfig() {
   const root = findProjectRoot();
   if (!root) {
@@ -87,8 +200,29 @@ function loadConfig() {
     gitIdentityDomain: c.gitIdentityDomain,
     sandboxEnv: resolve(root, c.sandboxEnv),
     jobsDir: resolve(root, c.jobsDir),
+    defaultAgent: c.defaultAgent,
     repos,
+    agents: c.agents || {},
   };
+}
+
+// Resuelve el adapter + overrides de config para un agente dado.
+function resolveAgent(cfg, name) {
+  const adapter = AGENTS[name];
+  if (!adapter) {
+    console.error(`Agente no soportado: "${name}". Opciones: ${Object.keys(AGENTS).join(', ')}`);
+    process.exit(1);
+  }
+  const override = cfg.agents[name] || {};
+  const auth = override.auth || adapter.auth;
+  const model = override.model ?? adapter.defaultModel;
+  return { name, adapter, auth, model };
+}
+
+function expandHome(p) {
+  if (p.startsWith('~/')) return join(homedir(), p.slice(2));
+  if (p === '~') return homedir();
+  return p;
 }
 
 // ---------- utils ----------
@@ -142,12 +276,11 @@ function hms(d = new Date()) {
   return `${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
 }
 
-function generateJobId(prompt) {
-  return `${ymd()}-${hms()}-gemini-${slug(prompt)}`;
+function generateJobId(agent, prompt) {
+  return `${ymd()}-${hms()}-${agent}-${slug(prompt)}`;
 }
 
 function parseFlags(args) {
-  // Devuelve { positional: [...], flags: {...} }
   const positional = [];
   const flags = {};
   for (let i = 0; i < args.length; i++) {
@@ -187,6 +320,43 @@ function isProcessAlive(pid) {
   catch { return false; }
 }
 
+// ---------- auth ----------
+
+// Prepara la auth del agente en el jobDir y devuelve los mounts/env para docker.
+// - oauth-dir: copia archivos del host + escribe archivos sintéticos, y devuelve
+//   un mount `-v` por cada uno (file-level). Los secretos quedan SOLO en disco
+//   del job (gitignored), nunca en meta.json.
+// - api-key: NO persiste el valor; devuelve el nombre de la env var para que el
+//   monitor la resuelva en runtime (config explícita o host env).
+function prepareAuth(authDesc, agentName, jobDir) {
+  const result = { mounts: [], authEnvName: null, hadCreds: false };
+  const d = authDesc || AGENTS[agentName].auth;
+  if (!d || d.mode === 'oauth-dir') {
+    const authDir = join(jobDir, `.${agentName}-auth`);
+    mkdirSync(authDir, { recursive: true });
+    let gi = 0;
+    for (const grp of ((d && d.dirs) || [])) {
+      const staging = join(authDir, `m${gi++}`);
+      mkdirSync(staging, { recursive: true });
+      for (const srcRaw of (grp.copies || [])) {
+        const src = expandHome(srcRaw);
+        if (!existsSync(src)) continue;
+        copyFileSync(src, join(staging, basename(src)));
+        result.hadCreds = true;
+      }
+      for (const s of (grp.synth || [])) {
+        writeFileSync(join(staging, s.name), s.content);
+        result.hadCreds = true;
+      }
+      // Mount a nivel directorio: permite escritura atómica (write-tmp + rename).
+      result.mounts.push([staging, grp.target]);
+    }
+  } else if (d.mode === 'api-key') {
+    result.authEnvName = d.env;
+  }
+  return result;
+}
+
 // ---------- init ----------
 
 async function cmdInit(args) {
@@ -210,20 +380,19 @@ async function cmdInit(args) {
   console.log(`✔ Creado ${CONFIG_FILENAME} y .delegate/sandbox.env en ${dest}`);
   console.log(``);
   console.log(`Próximos pasos:`);
-  console.log(`  1) Editá ${CONFIG_FILENAME} — ajustá "repos" y "dockerImage".`);
+  console.log(`  1) Editá ${CONFIG_FILENAME} — ajustá "repos", "defaultAgent" y "dockerImage".`);
   console.log(`  2) Editá .delegate/sandbox.env — poné valores FAKE para todo lo que tu código lea.`);
   console.log(`  3) Buildeá la imagen:  delegate build`);
   console.log(`  4) Agregá a tu .gitignore:`);
   console.log(`        .delegate/jobs/`);
   console.log(`        .delegate/sandbox.env`);
-  console.log(`  5) Probá:  delegate run gemini "decime hola" --timeout 2`);
+  console.log(`  5) Probá:  delegate run claude "decime hola" --timeout 2`);
 }
 
 // ---------- build ----------
 
 async function cmdBuild(args) {
   const { flags } = parseFlags(args);
-  // El config es opcional para build: si existe usamos su dockerImage, si no, default.
   let image = CONFIG_DEFAULTS.dockerImage;
   const root = findProjectRoot();
   if (root) {
@@ -250,11 +419,14 @@ async function cmdRun(args) {
   const cfg = loadConfig();
   const jobsDir = cfg.jobsDir;
   const { positional, flags } = parseFlags(args);
-  const agent = positional[0];
-  if (agent !== 'gemini') {
-    console.error(`MVP solo soporta "gemini" (recibido: ${agent}).`);
+
+  const agentName = positional[0];
+  if (!agentName || !AGENTS[agentName]) {
+    console.error(`Uso: delegate run <agente> "<prompt>". Agentes: ${Object.keys(AGENTS).join(', ')}`);
     process.exit(1);
   }
+  const agent = resolveAgent(cfg, agentName);
+  const model = flags.model || agent.model;
 
   let prompt = positional.slice(1).join(' ').trim();
   if (flags['prompt-file']) {
@@ -288,7 +460,7 @@ async function cmdRun(args) {
     process.exit(1);
   }
 
-  const id = generateJobId(prompt);
+  const id = generateJobId(agentName, prompt);
   const jobDir = join(jobsDir, id);
   mkdirSync(jobDir, { recursive: true });
 
@@ -298,6 +470,7 @@ async function cmdRun(args) {
   // 2) Clone aislado, sin remote, sin creds heredadas
   const wd = join(jobDir, 'workspace');
   console.log(`[${id}]`);
+  console.log(`  Agent:     ${agentName}${model ? ` (${model})` : ''}`);
   console.log(`  Cloning ${repo} (--local --no-hardlinks)...`);
   const cloneRes = spawnSync('git',
     ['clone', '--local', '--no-hardlinks', '--quiet', sourceRepo, wd],
@@ -310,11 +483,8 @@ async function cmdRun(args) {
   spawnSync('git', ['-C', wd, 'remote', 'remove', 'origin'], { stdio: 'ignore' });
   spawnSync('git', ['-C', wd, 'config', '--local', 'user.email', `agent-${id}@${cfg.gitIdentityDomain}`]);
   spawnSync('git', ['-C', wd, 'config', '--local', 'user.name', `Agent ${id}`]);
-  // No firmar commits (evita pedir gpg dentro del container)
   spawnSync('git', ['-C', wd, 'config', '--local', 'commit.gpgsign', 'false']);
 
-  // Capturar SHA y nombre de la branch base ANTES de crear la del agente,
-  // para tener referencia exacta del diff sin depender de master/main
   const baseShaRes = spawnSync('git', ['-C', wd, 'rev-parse', 'HEAD'],
     { stdio: ['ignore', 'pipe', 'pipe'] });
   const baseSha = baseShaRes.stdout.toString().trim();
@@ -324,18 +494,19 @@ async function cmdRun(args) {
 
   spawnSync('git', ['-C', wd, 'checkout', '-b', `agent/${id}`]);
 
-  // 3) Copiar auth Gemini (no montar el ~/.gemini original)
-  const authDir = join(jobDir, '.gemini-auth');
-  mkdirSync(authDir, { recursive: true });
-  for (const f of GEMINI_AUTH_FILES) {
-    const src = join(homedir(), '.gemini', f);
-    if (existsSync(src)) copyFileSync(src, join(authDir, f));
+  // 3) Preparar auth del agente (copias + sintéticos, o api-key)
+  const auth = prepareAuth(agent.auth, agentName, jobDir);
+  const authMode = agent.auth?.mode || 'oauth-dir';
+  if (authMode === 'oauth-dir' && !auth.hadCreds) {
+    console.error(`⚠ No encontré credenciales de "${agentName}" en el host para copiar.`);
+    console.error(`  Verificá que el CLI esté autenticado, o configurá auth api-key en ${CONFIG_FILENAME}.`);
   }
 
-  // 4) Meta inicial
+  // 4) Meta inicial (NO persiste secretos: solo paths de mount y nombre de env)
   const meta = {
     id,
-    agent: 'gemini',
+    agent: agentName,
+    agent_label: agent.adapter.label,
     repo,
     source_repo_path: sourceRepo,
     branch: `agent/${id}`,
@@ -352,8 +523,11 @@ async function cmdRun(args) {
     docker_container: null,
     docker_image: cfg.dockerImage,
     sandbox_env: cfg.sandboxEnv,
+    auth_mode: agent.auth?.mode || 'oauth-dir',
+    auth_mounts: auth.mounts,
+    auth_env_name: auth.authEnvName,
+    model: model || null,
     session_id: null,
-    model: null,
     exit_code: null,
     tokens: { input: 0, output: 0, cached: 0, total: 0 },
     events: { tool_calls: 0, errors: 0, messages: 0 },
@@ -363,7 +537,7 @@ async function cmdRun(args) {
   };
   writeMeta(jobDir, meta);
 
-  // 5) Spawn monitor detached. Stdout/stderr del monitor a un log para debug.
+  // 5) Spawn monitor detached
   const monitorLog = join(jobDir, 'monitor.log');
   const monitorOut = createWriteStream(monitorLog, { flags: 'a' });
   const monitor = spawn(process.execPath, [__filename, '_monitor', id], {
@@ -400,7 +574,15 @@ async function cmdMonitor(args) {
     process.exit(1);
   }
 
-  const meta = readMeta(jobDir);
+  const meta0 = readMeta(jobDir);
+  const agentName = meta0.agent;
+  const adapter = AGENTS[agentName];
+  if (!adapter) {
+    console.error(`Adapter desconocido en meta: ${agentName}`);
+    process.exit(1);
+  }
+
+  const meta = meta0;
   meta.status = 'running';
   meta.started_at = new Date().toISOString();
   meta.last_activity_at = meta.started_at;
@@ -408,12 +590,27 @@ async function cmdMonitor(args) {
 
   const transcriptPath = join(jobDir, 'transcript.jsonl');
   const transcript = createWriteStream(transcriptPath, { flags: 'a' });
-  const stderrLog = createWriteStream(join(jobDir, 'gemini-stderr.log'), { flags: 'a' });
+  const stderrLog = createWriteStream(join(jobDir, 'agent-stderr.log'), { flags: 'a' });
 
   const wd = join(jobDir, 'workspace');
-  const authDir = join(jobDir, '.gemini-auth');
   const containerName = `${cfg.containerPrefix}-${id}`;
   const promptText = readFileSync(join(jobDir, 'prompt.md'), 'utf8');
+
+  // Mounts de auth
+  const authMountArgs = [];
+  for (const [hostPath, containerPath] of (meta.auth_mounts || [])) {
+    authMountArgs.push('-v', `${hostPath}:${containerPath}`);
+  }
+  // Inyección de api-key (resuelta en runtime, sin persistir)
+  const authEnvArgs = [];
+  if (meta.auth_env_name) {
+    const override = cfg.agents[agentName]?.auth || {};
+    const value = override.value || process.env[meta.auth_env_name];
+    if (value) authEnvArgs.push('-e', `${meta.auth_env_name}=${value}`);
+  }
+  // Env extra del adapter
+  const extraEnvArgs = [];
+  for (const e of (adapter.extraEnv || [])) extraEnvArgs.push('-e', e);
 
   const dockerArgs = [
     'run', '--rm',
@@ -422,38 +619,32 @@ async function cmdMonitor(args) {
     '--memory=2g',
     '--cpus=2',
     '-v', `${wd}:/workspace`,
-    '-v', `${authDir}:/home/node/.gemini`,
+    ...authMountArgs,
     '--env-file', cfg.sandboxEnv,
-    '-e', 'GEMINI_CLI_TRUST_WORKSPACE=true',
+    ...authEnvArgs,
+    ...extraEnvArgs,
     '-w', '/workspace',
     '-u', 'node',
     cfg.dockerImage,
-    'gemini',
-    '--skip-trust',
-    '--yolo',
-    '--output-format', 'stream-json',
-    '-p', promptText,
+    ...adapter.buildCmd({ promptText, model: meta.model }),
   ];
 
   meta.docker_container = containerName;
   writeMeta(jobDir, meta);
 
-  const child = spawn('docker', dockerArgs, {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const child = spawn('docker', dockerArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  // Hard timeout
   const hardTimer = setTimeout(() => {
     console.error(`[${id}] Timeout ${meta.timeout_min}m alcanzado, killing container.`);
     spawnSync('docker', ['kill', containerName], { stdio: 'ignore' });
   }, meta.timeout_min * 60 * 1000);
 
-  // Stderr a su log
   child.stderr.on('data', (chunk) => stderrLog.write(chunk));
 
-  // Stdout: parsear stream-json line by line
+  // Acumulador de contexto entre eventos (texto final del agente)
+  const ctx = { assistantText: '', resultText: '' };
+
   let buffer = '';
-  let assistantText = '';
   child.stdout.on('data', (chunk) => {
     buffer += chunk.toString('utf8');
     let nl;
@@ -462,42 +653,15 @@ async function cmdMonitor(args) {
       buffer = buffer.slice(nl + 1);
       if (!line.trim()) continue;
       transcript.write(line + '\n');
-      handleEvent(line);
+      let evt;
+      try { evt = JSON.parse(line); }
+      catch { continue; }
+      const m = readMeta(jobDir);
+      m.last_activity_at = new Date().toISOString();
+      adapter.handleEvent(evt, m, ctx);
+      writeMeta(jobDir, m);
     }
   });
-
-  function handleEvent(line) {
-    let evt;
-    try { evt = JSON.parse(line); }
-    catch { return; }
-    const m = readMeta(jobDir);
-    m.last_activity_at = new Date().toISOString();
-
-    if (evt.type === 'init') {
-      m.session_id = evt.session_id || null;
-      m.model = evt.model || null;
-    } else if (evt.type === 'message') {
-      m.events.messages = (m.events.messages || 0) + 1;
-      if (evt.role === 'assistant' && typeof evt.content === 'string') {
-        assistantText += evt.content;
-      }
-    } else if (evt.type === 'tool_call' || evt.type === 'tool_use') {
-      m.events.tool_calls = (m.events.tool_calls || 0) + 1;
-    } else if (evt.type === 'error') {
-      m.events.errors = (m.events.errors || 0) + 1;
-    } else if (evt.type === 'result') {
-      const s = evt.stats || {};
-      m.tokens = {
-        input: s.input_tokens ?? s.input ?? 0,
-        output: s.output_tokens ?? 0,
-        cached: s.cached ?? 0,
-        total: s.total_tokens ?? 0,
-      };
-      if (typeof s.tool_calls === 'number') m.events.tool_calls = s.tool_calls;
-      m.result_status = evt.status || null;
-    }
-    writeMeta(jobDir, m);
-  }
 
   child.on('exit', (code, signal) => {
     clearTimeout(hardTimer);
@@ -509,14 +673,12 @@ async function cmdMonitor(args) {
     m.exit_code = code;
     m.duration_seconds = (new Date(m.ended_at) - new Date(m.started_at)) / 1000;
 
-    // Output final = lo último que escribió el assistant
-    if (assistantText.trim()) {
-      writeFileSync(join(jobDir, 'output.md'), assistantText.trim() + '\n');
-      m.summary = assistantText.trim().slice(0, 200).replace(/\s+/g, ' ');
+    const finalText = adapter.finalText(ctx);
+    if (finalText && finalText.trim()) {
+      writeFileSync(join(jobDir, 'output.md'), finalText.trim() + '\n');
+      m.summary = finalText.trim().slice(0, 200).replace(/\s+/g, ' ');
     }
 
-    // Detectar si hubo cambios usando el SHA capturado al clone
-    // (más robusto que asumir master/main, soporta repos con cualquier branch base)
     const base = m.base_commit || 'HEAD~0';
     const diffRes = spawnSync('git', ['-C', wd, 'rev-list', '--count', `${base}..HEAD`],
       { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -524,8 +686,6 @@ async function cmdMonitor(args) {
     m.commits_ahead = commitsAhead;
     m.has_changes = commitsAhead > 0;
 
-    // Detectar archivos untracked (multimedia, dumps, lo que sea que el agente
-    // dejó sin committear). Importante: Gemini puede generar imágenes/audio.
     const untrackedRes = spawnSync('git', ['-C', wd, 'ls-files', '--others', '--exclude-standard'],
       { stdio: ['ignore', 'pipe', 'pipe'] });
     const untrackedPaths = untrackedRes.stdout.toString().split('\n').filter(Boolean);
@@ -547,16 +707,13 @@ async function cmdMonitor(args) {
       m.status = 'failed';
     }
 
-    // Si falló o no llegó result event, capturar último contexto de stderr
     if (m.status !== 'ok') {
       try {
-        const stderrPath = join(jobDir, 'gemini-stderr.log');
+        const stderrPath = join(jobDir, 'agent-stderr.log');
         if (existsSync(stderrPath)) {
           const stderrText = readFileSync(stderrPath, 'utf8');
           const lines = stderrText.split('\n').filter((l) => l.trim());
           m.stderr_tail = lines.slice(-5);
-
-          // Detectar causas conocidas
           const all = stderrText.toLowerCase();
           if (all.includes('exhausted your capacity') || all.includes('quota') || all.includes('rate limit')) {
             m.failure_reason = 'quota_or_rate_limit';
@@ -572,7 +729,6 @@ async function cmdMonitor(args) {
     }
     writeMeta(jobDir, m);
 
-    // Notificación desktop (best-effort, Linux)
     try {
       spawnSync('notify-send', [
         `Delegate ${m.status}: ${id}`,
@@ -585,7 +741,6 @@ async function cmdMonitor(args) {
 }
 
 function detectBaseBranch(wd) {
-  // Devuelve "master" o "main" según lo que exista en el clone
   for (const b of ['master', 'main']) {
     const r = spawnSync('git', ['-C', wd, 'rev-parse', '--verify', b],
       { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -608,7 +763,7 @@ async function cmdList(args) {
 
   const rows = ids.map((id) => {
     try { return readMeta(join(jobsDir, id)); }
-    catch { return { id, status: '?', repo: '?', tokens: {}, events: {} }; }
+    catch { return { id, status: '?', repo: '?', agent: '?', tokens: {}, events: {} }; }
   });
 
   const filtered = flags.status ? rows.filter((r) => r.status === flags.status) : rows;
@@ -617,7 +772,6 @@ async function cmdList(args) {
     return;
   }
 
-  // Detectar monitores muertos en jobs running
   for (const r of filtered) {
     if (r.status === 'running' && r.monitor_pid && !isProcessAlive(r.monitor_pid)) {
       r._stale = true;
@@ -630,9 +784,10 @@ async function cmdList(args) {
   };
   const reset = '\x1b[0m';
 
-  const header = ['ID', 'STATUS', 'REPO', 'TOKENS', 'TOOLS', 'COMMITS', 'DURATION'];
+  const header = ['ID', 'AGENT', 'STATUS', 'REPO', 'TOKENS', 'TOOLS', 'COMMITS', 'DURATION'];
   const data = filtered.map((r) => [
     r.id,
+    r.agent || '-',
     (colors[r.status] || '') + r.status + (r._stale ? '*' : '') + reset,
     r.repo || '-',
     fmtTokens(r.tokens),
@@ -641,7 +796,6 @@ async function cmdList(args) {
     fmtDuration(r.duration_seconds),
   ]);
 
-  // simple column print
   const widths = header.map((h, i) => Math.max(
     stripAnsi(h).length,
     ...data.map((row) => stripAnsi(row[i]).length)
@@ -680,6 +834,7 @@ async function cmdShow(args) {
   console.log(`created:      ${meta.created_at}`);
   console.log(`duration:     ${fmtDuration(meta.duration_seconds)}`);
   console.log(`tokens:       in=${meta.tokens?.input || 0} out=${meta.tokens?.output || 0} cached=${meta.tokens?.cached || 0} total=${meta.tokens?.total || 0}`);
+  if (meta.cost_usd != null) console.log(`cost:         $${meta.cost_usd}`);
   console.log(`tool_calls:   ${meta.events?.tool_calls ?? 0}`);
   console.log(`errors:       ${meta.events?.errors ?? 0}`);
   console.log(`commits ahead: ${meta.commits_ahead ?? '-'}`);
@@ -706,8 +861,7 @@ async function cmdShow(args) {
     const wd = join(jobDir, 'workspace');
     const base = meta.base_commit || detectBaseBranch(wd);
     console.log(`-- git log ${base}..HEAD --`);
-    spawnSync('git', ['-C', wd, 'log', '--oneline', `${base}..HEAD`],
-      { stdio: 'inherit' });
+    spawnSync('git', ['-C', wd, 'log', '--oneline', `${base}..HEAD`], { stdio: 'inherit' });
     console.log(``);
   }
 
@@ -771,7 +925,6 @@ async function cmdReview(args) {
     console.log(``);
   }
 
-  // Acciones no-interactivas tienen prioridad sobre cualquier early-return
   if (flags.export) {
     exportUntracked(meta, jobDir, flags.export);
   }
@@ -817,7 +970,6 @@ async function cmdReview(args) {
     return;
   }
 
-  // Interactivo
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const ans = (await rl.question('Acción [f]etch a source repo · [d]iscard · [s]kip: ')).trim().toLowerCase();
   rl.close();
@@ -912,8 +1064,9 @@ Setup (en la raíz del proyecto target):
   delegate build                       Buildea la imagen Docker (lee dockerImage del config)
 
 Comandos:
-  delegate run gemini "<prompt>"       Lanza job. Devuelve id inmediatamente.
+  delegate run <agente> "<prompt>"     Lanza job. Agentes: ${Object.keys(AGENTS).join(', ')}
                   [--repo <key>]                   default: workspace (claves del config)
+                  [--model <id>]                   override del modelo del agente
                   [--prompt-file <path>]           prompt desde archivo
                   [--timeout <minutos>]            default: 30
   delegate list  [--status running|ok|failed|killed]

@@ -4,9 +4,19 @@
   "gitIdentityDomain": "delegate.local",
   "sandboxEnv": ".delegate/sandbox.env",
   "jobsDir": ".delegate/jobs",
+  "defaultAgent": "claude",
   "repos": {
     "workspace": ".",
     "backend": "backend",
     "frontend": "frontend"
+  },
+  "agents": {
+    "claude": {
+      "comment": "Default auth = copia el OAuth de ~/.claude. Para arranque rápido sin OAuth, usá api-key:",
+      "_authApiKeyExample": { "mode": "api-key", "env": "ANTHROPIC_API_KEY", "fromHostEnv": true }
+    },
+    "gemini": {
+      "comment": "gemini-cli se retira 2026-06-18. Auth por defecto = copia OAuth de ~/.gemini."
+    }
   }
 }
