@@ -1,0 +1,8 @@
+# Jobs y sandbox.env reales nunca se versionan en el repo del tool.
+# (En un proyecto target, lo gitignorea el proyecto, no este repo.)
+node_modules/
+*.log
+
+# Por si alguien prueba el tool dentro de su propio repo:
+.delegate/jobs/
+.delegate/sandbox.env

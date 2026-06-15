@@ -1,0 +1,106 @@
+---
+name: delegate
+description: Delegar tareas a Gemini en sandbox Docker aislado. Usar cuando el user dice "pasale esto a gemini", "que lo haga gemini", "delega esto", "esperá mientras hago X", o cuando hay una tarea paralelizable que no requiere atención inmediata (research, generación de assets, copy, drafts). El agente trabaja en clone aislado sin remote git, sin credenciales del host. Devuelve job-id inmediatamente, notifica al terminar, branch local queda esperando review humano.
+allowed-tools: Read, Bash
+---
+
+# Delegar tareas a Gemini en sandbox
+
+Sistema local para delegar trabajo a Gemini en background, dentro de un container Docker aislado, con un clone limpio del repo (sin remote, sin credenciales). El agente puede leer/escribir libremente en su sandbox y commitear a una branch local; **nunca puede pushear ni acceder a creds reales**. El review y push lo hace el humano (o vos en su nombre, con confirmación).
+
+> ⚠️ Este es un template genérico. Ajustá las zonas "✅ Sí / ❌ No" con las
+> reglas reales de TU proyecto (qué código nunca debe tocar un agente externo).
+
+## Cuándo usar este skill
+
+✅ **Sí**:
+- Research que toma tiempo (docs externas, benchmarks competitivos, cambios de APIs)
+- Generación de copy / drafts / descripciones
+- Generación de imágenes/audio (assets para muestrario, banners, redes)
+- Resúmenes de docs largos del repo
+- Sugerencias de UI/UX, prototipos descartables
+- Cualquier tarea creativa o exploratoria donde la latencia no importa
+
+❌ **No** (ajustar a tu proyecto):
+- Código crítico de negocio / facturación / pagos
+- Scripts que toquen datos productivos o APIs externas con efecto
+- Migrations / cambios de schema
+- Tareas urgentes donde necesitás la respuesta ya (spin-up de 30s-3min)
+
+## Comandos
+
+Todos se invocan desde la raíz del proyecto (donde está `delegate.config.json`):
+
+```bash
+# Lanzar job (devuelve id inmediatamente, ~1s)
+delegate run gemini "<prompt>" \
+    [--repo <key>] \                 # claves definidas en delegate.config.json
+    [--prompt-file <path>] \         # prompt desde archivo (para prompts largos)
+    [--timeout <minutos>]            # default: 30, máximo recomendado 60
+
+# Estado global
+delegate list
+delegate list --status running
+
+# Detalle de un job (acepta prefijo del id)
+delegate show <id>
+
+# Review interactivo (al terminar)
+delegate review <id>
+delegate review <id> --show-diff           # diff completo
+delegate review <id> --export <dir>        # copia archivos untracked (multimedia)
+delegate review <id> --fetch               # importa branch a source repo (no-interactivo)
+delegate review <id> --discard             # borra todo el job
+
+# Matar job en running
+delegate kill <id>
+```
+
+> Si no instalaste `delegate` global, reemplazá `delegate` por
+> `node <path-al-tool>/bin/delegate.mjs`.
+
+## Flow típico
+
+1. **Lanzar**: `delegate run gemini "..." --repo workspace`. Devuelve `id`.
+2. **Seguir trabajando** en lo tuyo. El monitor corre detached.
+3. **Notificación desktop** cuando termina (o falla).
+4. **Inspeccionar**: `delegate show <id>` para ver tokens, output, tool calls, commits.
+5. **Review**: `delegate review <id>`. Te muestra log + diff + untracked files. Decidís:
+   - `[f]etch` → trae la branch `agent/<id>` al source repo. Después vos pusheás manualmente.
+   - `[d]iscard` → borra todo el job. La branch nunca tocó nada.
+   - `[s]kip` → deja el job en disco para revisar después.
+
+## Tips de prompting para Gemini
+
+- **Sé explícito sobre el output esperado**: "dejá un archivo en `output/<nombre>.md`" o "respondé en formato JSON con campos X, Y, Z".
+- **Separá multimedia de código**: "los assets de imagen guardalos en `/workspace/output/` y NO hagas `git add` de ellos" (los recuperás después con `--export`).
+- **Pedí commits explícitos** si querés branch con historia: "después hacé `git add output/` y `git commit -m 'asunto'`".
+- **NO le pidas que pushee** — no tiene cómo, y si lo intenta va a fallar ruidosamente. La branch queda local hasta que vos decidas.
+- **Para tareas de research**, pedí informe markdown estructurado: "agrupado por área, máximo 30 líneas, cada hallazgo con fuente".
+
+## Aislamiento (qué entra y qué no)
+
+**Adentro del container**:
+- `/workspace` → clone aislado del repo target, sin remote, branch `agent/<id>`
+- `/home/node/.gemini` → copia de auth Gemini (oauth_creds, etc.) — para que el CLI funcione
+
+**Afuera del container** (jamás):
+- Tu `~/.gitconfig`, `~/.ssh`, `~/.config/gh`, `~/.aws`, `~/.gnupg`
+- Credenciales reales de cualquier servicio
+- Variables de env reales — adentro hay solo mocks (ver `.delegate/sandbox.env`)
+
+**Network**: bridge default. Puede llamar al API de Gemini (necesita) y hacer requests externas (research). NO tiene credenciales de tus servicios privados, así que cualquier request real va a fallar con 401.
+
+## Modos de falla conocidos
+
+- `failure_reason: quota_or_rate_limit` — cuota Gemini exhausted. Esperar minutos y reintentar.
+- `failure_reason: network` — sin conectividad. Verificar internet del host.
+- `failure_reason: auth` — el OAuth de `~/.gemini/` venció. Correr `gemini` interactivo en host para refrescar.
+- `failure_reason: unknown` con `tokens: 0` y exit 1 — gemini-cli murió sin emitir `result`. Ver `meta.stderr_tail`.
+
+## Importante para vos (Claude)
+
+- **Nunca lanzar un job sin que el user lo pida** o sin contexto claro. Es una herramienta del user, no un atajo para descargar trabajo automáticamente.
+- **Antes de lanzar**, confirmá: qué prompt va a recibir Gemini, qué repo target, qué timeout. Mostrale al user el prompt antes de spawnear.
+- **Después de lanzar**, no te pongas a `delegate show` cada 30s — pasá a otra cosa. Cuando el user pregunte el estado, ahí sí.
+- **El review lo hacen juntos**. No invoques `--fetch` ni `--discard` automáticamente. Mostrá el diff y esperá decisión.

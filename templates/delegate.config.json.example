@@ -1,0 +1,12 @@
+{
+  "dockerImage": "delegate-agent:latest",
+  "containerPrefix": "delegate",
+  "gitIdentityDomain": "delegate.local",
+  "sandboxEnv": ".delegate/sandbox.env",
+  "jobsDir": ".delegate/jobs",
+  "repos": {
+    "workspace": ".",
+    "backend": "backend",
+    "frontend": "frontend"
+  }
+}

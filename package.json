@@ -1,0 +1,19 @@
+{
+  "name": "delegate-agent",
+  "version": "0.1.0",
+  "description": "Local agent sandbox orchestrator — delega tareas a Gemini CLI en Docker aislado, con clone sin remote y review humano.",
+  "type": "module",
+  "bin": {
+    "delegate": "bin/delegate.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/",
+    "docker/",
+    "templates/",
+    "README.md"
+  ],
+  "license": "MIT"
+}
