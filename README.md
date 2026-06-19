@@ -113,13 +113,17 @@ Si usás Claude Code, copiá `templates/SKILL.md.example` a `.claude/skills/dele
 
 ## Agentes
 
-| Agente | Comando | Estado | Auth por defecto |
-|---|---|---|---|
-| **Claude Code** | `delegate run claude "..."` | ✅ estable, recomendado | OAuth `~/.claude/.credentials.json` o `ANTHROPIC_API_KEY` |
-| **Gemini CLI** | `delegate run gemini "..."` | ⚠️ Google lo retira el **2026-06-18** | OAuth `~/.gemini` o `GEMINI_API_KEY` |
-| Antigravity CLI (`agy`) | — | 🔜 a sumar (reemplazo de Gemini) cuando sus flags headless estén confirmadas | — |
+Idea: cada agente rinde en lo suyo. **Claude** para código; **Gemini/Antigravity** para creativo, research, imagen, música, marketing y modelos generales de Google. Querés ambos operativos y delegás a cada uno según la tarea.
 
-El default está en `defaultAgent` del config. Pineá el modelo con `--model` o en `config.agents.<agente>.model` (ej. para Claude conviene un modelo más barato que el default de tu plan en tareas delegadas).
+| Agente | Comando | Rol | Estado | Auth por defecto |
+|---|---|---|---|---|
+| **Claude Code** | `delegate run claude "..."` | código | ✅ estable | OAuth `~/.claude/.credentials.json` o `ANTHROPIC_API_KEY` |
+| **Antigravity CLI** (`agy`) | `delegate run agy "..."` | creativo/research | 🟡 implementado, a validar live | **API key** `GEMINI_API_KEY` (AI Studio) o `ANTIGRAVITY_API_KEY` |
+| **Gemini CLI** | `delegate run gemini "..."` | legacy | ⛔ Google lo **retira 2026-06-18** | OAuth `~/.gemini` |
+
+El default está en `defaultAgent` del config. Pineá modelo con `--model` o en `config.agents.<agente>.model`.
+
+**Nota sobre `agy` (headless):** su modo `-p` descarta stdout cuando no hay TTY, así que el adapter lo envuelve con `unbuffer` (PTY) y captura texto plano sanitizado de ANSI. La auth headless es por **API key** (no OAuth): seteá `GEMINI_API_KEY` en tu env y delegate la inyecta al container sin persistirla. El binario `agy` se instala en la imagen vía el instalador oficial de Google (ver Dockerfile).
 
 ## Uso
 

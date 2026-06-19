@@ -1,8 +1,30 @@
-# Jobs y sandbox.env reales nunca se versionan en el repo del tool.
-# (En un proyecto target, lo gitignorea el proyecto, no este repo.)
+# Dependencias
 node_modules/
 *.log
 
-# Por si alguien prueba el tool dentro de su propio repo:
-.delegate/jobs/
-.delegate/sandbox.env
+# Estado de jobs + env del sandbox: NUNCA versionar.
+# Los jobs contienen clones, copias de OAuth y transcripts; sandbox.env puede
+# tener valores reales. En un proyecto target esto lo cubre su propio .gitignore;
+# acá lo dejamos por si alguien prueba el tool dentro de este repo.
+.delegate/
+delegate.config.json
+sandbox.env
+
+# --- Credenciales y secretos (defensivo) ---
+# Para que NADIE que use o pruebe el tool commitee creds por accidente.
+*.key
+*.pem
+*.p12
+*.pfx
+*.credentials.json
+.credentials.json
+oauth_creds.json
+*oauth*token*
+.env
+.env.*
+!.env.example
+secrets/
+.secrets/
+
+# NO ignoramos los templates *.example (son mocks/placeholders a propósito):
+!*.example

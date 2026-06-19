@@ -12,11 +12,15 @@
   },
   "agents": {
     "claude": {
-      "comment": "Default auth = copia el OAuth de ~/.claude. Para arranque rápido sin OAuth, usá api-key:",
-      "_authApiKeyExample": { "mode": "api-key", "env": "ANTHROPIC_API_KEY", "fromHostEnv": true }
+      "comment": "Código. Auth default = OAuth de ~/.claude. Pineá modelo barato para tareas delegadas:",
+      "model": null
+    },
+    "agy": {
+      "comment": "Antigravity CLI (creativo/research/imagen/música). API key de AI Studio. keyFile la lee de un archivo (no la pongas inline acá). Si no, cae a la env var del host.",
+      "auth": { "mode": "api-key", "env": "GEMINI_API_KEY", "keyFile": "~/.config/delegate/agy.key" }
     },
     "gemini": {
-      "comment": "gemini-cli se retira 2026-06-18. Auth por defecto = copia OAuth de ~/.gemini."
+      "comment": "gemini-cli LEGACY — Google lo retira 2026-06-18. Usá 'agy' en su lugar."
     }
   }
 }

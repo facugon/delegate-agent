@@ -159,6 +159,33 @@ const AGENTS = {
     },
     finalText(ctx) { return ctx.resultText || ctx.assistantText; },
   },
+
+  // Antigravity CLI — reemplazo de gemini-cli (Google retira gemini-cli 2026-06-18).
+  // Headless es delicado: `agy -p` DESCARTA stdout sin TTY (exit 0, vacío), y
+  // `--output-format json` está reportado roto. Por eso lo envolvemos con
+  // `unbuffer` (PTY, pasa argv nativo) y capturamos texto plano sanitizado.
+  // El parseo de stream-json + métricas de tokens queda como refinamiento futuro
+  // (requiere ver el schema real de eventos de agy con una API key).
+  agy: {
+    label: 'agy',
+    defaultModel: null,
+    sanitizeAnsi: true, // salida vía PTY → puede traer códigos ANSI
+    extraEnv: [],
+    auth: {
+      mode: 'api-key',
+      env: 'GEMINI_API_KEY', // AI Studio key; alternativamente ANTIGRAVITY_API_KEY
+    },
+    buildCmd({ promptText, model }) {
+      return [
+        'unbuffer', // aloca PTY (paquete `expect`); evita el drop de stdout non-TTY
+        'agy', '-p', promptText,
+        '--yes', // auto-aprueba confirmaciones
+        ...(model ? ['--model', model] : []),
+      ];
+    },
+    handleEvent() { /* texto plano: no hay eventos JSON que parsear (v1) */ },
+    finalText(ctx) { return ctx.rawText; },
+  },
 };
 
 // ---------- config ----------
@@ -353,6 +380,7 @@ function prepareAuth(authDesc, agentName, jobDir) {
     }
   } else if (d.mode === 'api-key') {
     result.authEnvName = d.env;
+    result.authKeyFile = d.keyFile ? expandHome(d.keyFile) : null;
   }
   return result;
 }
@@ -526,6 +554,7 @@ async function cmdRun(args) {
     auth_mode: agent.auth?.mode || 'oauth-dir',
     auth_mounts: auth.mounts,
     auth_env_name: auth.authEnvName,
+    auth_key_file: auth.authKeyFile || null,
     model: model || null,
     session_id: null,
     exit_code: null,
@@ -605,7 +634,11 @@ async function cmdMonitor(args) {
   const authEnvArgs = [];
   if (meta.auth_env_name) {
     const override = cfg.agents[agentName]?.auth || {};
-    const value = override.value || process.env[meta.auth_env_name];
+    let value = override.value;
+    if (!value && meta.auth_key_file && existsSync(meta.auth_key_file)) {
+      value = readFileSync(meta.auth_key_file, 'utf8').trim();
+    }
+    if (!value) value = process.env[meta.auth_env_name];
     if (value) authEnvArgs.push('-e', `${meta.auth_env_name}=${value}`);
   }
   // Env extra del adapter
@@ -642,17 +675,20 @@ async function cmdMonitor(args) {
   child.stderr.on('data', (chunk) => stderrLog.write(chunk));
 
   // Acumulador de contexto entre eventos (texto final del agente)
-  const ctx = { assistantText: '', resultText: '' };
+  const ctx = { assistantText: '', resultText: '', rawText: '' };
 
   let buffer = '';
   child.stdout.on('data', (chunk) => {
     buffer += chunk.toString('utf8');
     let nl;
     while ((nl = buffer.indexOf('\n')) !== -1) {
-      const line = buffer.slice(0, nl);
+      const raw = buffer.slice(0, nl);
       buffer = buffer.slice(nl + 1);
+      transcript.write(raw + '\n');
+      const line = adapter.sanitizeAnsi ? stripAnsi(raw).replace(/\r/g, '') : raw;
       if (!line.trim()) continue;
-      transcript.write(line + '\n');
+      // Fallback de texto plano (agentes que no emiten JSON parseable, ej agy)
+      ctx.rawText += line + '\n';
       let evt;
       try { evt = JSON.parse(line); }
       catch { continue; }
