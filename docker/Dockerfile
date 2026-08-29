@@ -9,10 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # CLIs de agente vía npm. gemini-cli lo retira Google el 2026-06-18; claude-code
 # es el backend de código estable. (Antigravity CLI `agy` se instala más abajo.)
-RUN npm install -g @google/gemini-cli@latest @anthropic-ai/claude-code@latest
+RUN npm install -g @google/gemini-cli@latest @anthropic-ai/claude-code@latest @openai/codex@latest
 
 # El user "node" viene preinstalado en node:22-slim con UID 1000 (coincide con host)
-RUN mkdir -p /home/node/.gemini /home/node/.claude /workspace \
+RUN mkdir -p /home/node/.gemini /home/node/.claude /home/node/.codex /workspace \
  && chown -R node:node /home/node /workspace
 
 # Config mínima de Claude horneada (onboarding + bypass) para correr headless sin

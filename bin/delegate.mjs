@@ -11,7 +11,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import {
   mkdirSync, writeFileSync, readFileSync, readdirSync, copyFileSync,
-  existsSync, createWriteStream, statSync, rmSync,
+  existsSync, createWriteStream, statSync, rmSync, cpSync, appendFileSync,
 } from 'node:fs';
 import { resolve, join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -179,12 +179,69 @@ const AGENTS = {
       return [
         'unbuffer', // aloca PTY (paquete `expect`); evita el drop de stdout non-TTY
         'agy', '-p', promptText,
-        '--yes', // auto-aprueba confirmaciones
+        '--dangerously-skip-permissions', // auto-aprueba confirmaciones de tools
         ...(model ? ['--model', model] : []),
       ];
     },
     handleEvent() { /* texto plano: no hay eventos JSON que parsear (v1) */ },
     finalText(ctx) { return ctx.rawText; },
+  },
+
+  // Codex CLI (OpenAI). Auth = login ChatGPT (consume cuota del plan mensual,
+  // no pay-per-token de API key) → ~/.codex/auth.json. `codex exec --json`
+  // emite JSONL limpio a stdout (logs `tracing` van a stderr).
+  codex: {
+    label: 'codex',
+    defaultModel: null,
+    extraEnv: [],
+    auth: {
+      mode: 'oauth-dir',
+      dirs: [{
+        target: '/home/node/.codex',
+        copies: ['~/.codex/auth.json', '~/.codex/config.toml'],
+        synth: [],
+      }],
+    },
+    buildCmd({ promptText, model }) {
+      return [
+        'codex', 'exec',
+        '--json',
+        '--dangerously-bypass-approvals-and-sandbox',
+        '-C', '/workspace',
+        ...(model ? ['--model', model] : []),
+        promptText,
+      ];
+    },
+    handleEvent(evt, m, ctx) {
+      if (evt.type === 'thread.started') {
+        m.session_id = evt.thread_id || m.session_id || null;
+      } else if (evt.type === 'item.completed') {
+        const item = evt.item || {};
+        m.events.messages = (m.events.messages || 0) + 1;
+        if (item.type === 'agent_message') {
+          const text = item.text ?? item.content;
+          if (typeof text === 'string') ctx.assistantText += text;
+        } else if (['command_execution', 'patch_apply', 'mcp_tool_call', 'file_change'].includes(item.type)) {
+          m.events.tool_calls = (m.events.tool_calls || 0) + 1;
+        } else if (item.type === 'error') {
+          m.events.errors = (m.events.errors || 0) + 1;
+        }
+      } else if (evt.type === 'turn.completed') {
+        const u = evt.usage || {};
+        const input = u.input_tokens ?? 0;
+        const output = u.output_tokens ?? 0;
+        const cached = u.cached_input_tokens ?? 0;
+        const cacheWrite = u.cache_write_input_tokens ?? 0;
+        m.tokens = { input, output, cached, total: input + output + cached + cacheWrite };
+        m.result_status = 'completed';
+      } else if (evt.type === 'turn.failed') {
+        m.events.errors = (m.events.errors || 0) + 1;
+        m.result_status = 'failed';
+      } else if (evt.type === 'error') {
+        m.events.errors = (m.events.errors || 0) + 1;
+      }
+    },
+    finalText(ctx) { return ctx.assistantText || ctx.rawText; },
   },
 };
 
@@ -345,6 +402,35 @@ function fmtTokens(t) {
 function isProcessAlive(pid) {
   try { process.kill(pid, 0); return true; }
   catch { return false; }
+}
+
+// ---------- base context (skills/rules cross-agente) ----------
+
+// Paths relativos a la raíz del proyecto (cfg.projectRoot) que forman la base
+// de contexto común a cualquier agente: reglas + skills (.agents/) y los
+// punteros de cada agente a esas reglas (AGENTS.md=Codex, CLAUDE.md=Claude,
+// GEMINI.md=Antigravity). Si el repo target (sourceRepo) ya trae su propia
+// copia de alguno, se respeta y no se pisa.
+const BASE_CONTEXT_PATHS = ['.agents', 'AGENTS.md', 'CLAUDE.md', 'GEMINI.md'];
+
+function injectBaseContext(cfg, sourceRepo, wd) {
+  if (resolve(sourceRepo) === resolve(cfg.projectRoot)) return; // ya lo trae el propio clone
+  const injected = [];
+  for (const rel of BASE_CONTEXT_PATHS) {
+    const src = join(cfg.projectRoot, rel);
+    const dst = join(wd, rel);
+    if (existsSync(src) && !existsSync(dst)) {
+      cpSync(src, dst, { recursive: true });
+      injected.push(rel);
+    }
+  }
+  if (injected.length) {
+    // No versionar esto en el repo target: es contexto inyectado, no parte
+    // del código de ese repo. Exclude local (no toca .gitignore versionado).
+    const excludePath = join(wd, '.git', 'info', 'exclude');
+    const header = '\n# delegate: contexto base inyectado (no versionar en este repo)\n';
+    appendFileSync(excludePath, header + injected.map((p) => `/${p}\n`).join(''));
+  }
 }
 
 // ---------- auth ----------
@@ -521,6 +607,14 @@ async function cmdRun(args) {
   const baseBranch = baseBranchRes.stdout.toString().trim();
 
   spawnSync('git', ['-C', wd, 'checkout', '-b', `agent/${id}`]);
+
+  // 2.5) Inyectar contexto base del proyecto (rules + skills + punteros de
+  // agente) si el repo target no lo tiene propio. `sourceRepo` puede ser
+  // api-cms/site (repos hermanos sin .agents/ ni AGENTS.md/CLAUDE.md/GEMINI.md
+  // propios) — sin esto, un agente delegado ahí queda ciego a las reglas del
+  // proyecto. Se inyecta SIEMPRE (no solo para codex): el objetivo es una base
+  // de skills/rules común a cualquier agente/modelo, no un parche puntual.
+  injectBaseContext(cfg, sourceRepo, wd);
 
   // 3) Preparar auth del agente (copias + sintéticos, o api-key)
   const auth = prepareAuth(agent.auth, agentName, jobDir);
