@@ -174,6 +174,11 @@ const AGENTS = {
     auth: {
       mode: 'api-key',
       env: 'GEMINI_API_KEY', // AI Studio key; alternativamente ANTIGRAVITY_API_KEY
+      // Sin esto, agy ignora la env var y pide login OAuth interactivo (rompe headless).
+      settingsFile: {
+        target: '/home/node/.gemini/antigravity-cli/settings.json',
+        content: JSON.stringify({ modelProvider: 'gemini' }),
+      },
     },
     buildCmd({ promptText, model }) {
       return [
@@ -257,33 +262,61 @@ function findProjectRoot(start = process.cwd()) {
   }
 }
 
-function loadConfig() {
-  const root = findProjectRoot();
-  if (!root) {
-    console.error(`No encontré ${CONFIG_FILENAME} en este directorio ni en sus padres.`);
-    console.error(`Corré "delegate init" en la raíz del proyecto para crearlo.`);
-    process.exit(1);
-  }
-  let raw;
+// Config global de usuario (~/.delegate/config.json): defaults compartidos por
+// todos los proyectos (agents/auth, dockerImage, defaultAgent, etc.) — evita
+// tener que repetir delegate.config.json en cada carpeta. Un delegate.config.json
+// de proyecto (encontrado subiendo desde cwd) sigue funcionando y pisa al global;
+// si no hay ninguno, se usa el global solo, con cwd como raíz del "repo".
+const GLOBAL_CONFIG_PATH = join(homedir(), '.delegate', 'config.json');
+
+function loadGlobalConfig() {
+  if (!existsSync(GLOBAL_CONFIG_PATH)) return {};
   try {
-    raw = JSON.parse(readFileSync(join(root, CONFIG_FILENAME), 'utf8'));
+    return JSON.parse(readFileSync(GLOBAL_CONFIG_PATH, 'utf8'));
   } catch (e) {
-    console.error(`No pude parsear ${join(root, CONFIG_FILENAME)}: ${e.message}`);
+    console.error(`No pude parsear ${GLOBAL_CONFIG_PATH}: ${e.message}`);
     process.exit(1);
   }
+}
+
+function loadConfig() {
+  const global = loadGlobalConfig();
+  const root = findProjectRoot();
+  let raw;
+  if (root) {
+    let projectRaw;
+    try {
+      projectRaw = JSON.parse(readFileSync(join(root, CONFIG_FILENAME), 'utf8'));
+    } catch (e) {
+      console.error(`No pude parsear ${join(root, CONFIG_FILENAME)}: ${e.message}`);
+      process.exit(1);
+    }
+    raw = {
+      ...global,
+      ...projectRaw,
+      agents: { ...(global.agents || {}), ...(projectRaw.agents || {}) },
+    };
+  } else if (Object.keys(global).length) {
+    raw = global;
+  } else {
+    console.error(`No encontré ${CONFIG_FILENAME} en este directorio ni en sus padres, ni ${GLOBAL_CONFIG_PATH}.`);
+    console.error(`Corré "delegate init" en la raíz del proyecto, o creá el config global.`);
+    process.exit(1);
+  }
+  const effectiveRoot = root || process.cwd();
   const c = { ...CONFIG_DEFAULTS, ...raw };
   const reposRaw = raw.repos || CONFIG_DEFAULTS.repos;
   const repos = {};
   for (const [key, rel] of Object.entries(reposRaw)) {
-    repos[key] = resolve(root, rel);
+    repos[key] = resolve(effectiveRoot, rel);
   }
   return {
-    projectRoot: root,
+    projectRoot: effectiveRoot,
     dockerImage: c.dockerImage,
     containerPrefix: c.containerPrefix,
     gitIdentityDomain: c.gitIdentityDomain,
-    sandboxEnv: resolve(root, c.sandboxEnv),
-    jobsDir: resolve(root, c.jobsDir),
+    sandboxEnv: resolve(effectiveRoot, c.sandboxEnv),
+    jobsDir: resolve(effectiveRoot, c.jobsDir),
     defaultAgent: c.defaultAgent,
     repos,
     agents: c.agents || {},
@@ -467,6 +500,13 @@ function prepareAuth(authDesc, agentName, jobDir) {
   } else if (d.mode === 'api-key') {
     result.authEnvName = d.env;
     result.authKeyFile = d.keyFile ? expandHome(d.keyFile) : null;
+    if (d.settingsFile) {
+      const authDir = join(jobDir, `.${agentName}-auth`);
+      const staging = join(authDir, 's0');
+      mkdirSync(staging, { recursive: true });
+      writeFileSync(join(staging, basename(d.settingsFile.target)), d.settingsFile.content);
+      result.mounts.push([staging, dirname(d.settingsFile.target)]);
+    }
   }
   return result;
 }
