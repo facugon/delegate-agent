@@ -171,14 +171,18 @@ const AGENTS = {
     defaultModel: null,
     sanitizeAnsi: true, // salida vía PTY → puede traer códigos ANSI
     extraEnv: [],
+    // OAuth real (cuenta Plus), no api-key de AI Studio: esa key pega contra
+    // el free tier público (generativelanguage.googleapis.com, cuota propia,
+    // gemini-3.1-pro con limit:0 ahí) en vez de tu cuota de Antigravity.
+    // El container no tiene keyring de SO, así que agy cae a file storage
+    // para el token — login inicial una sola vez (interactivo, en tu terminal,
+    // no por delegate), después queda cacheado y se refresca solo.
     auth: {
-      mode: 'api-key',
-      env: 'GEMINI_API_KEY', // AI Studio key; alternativamente ANTIGRAVITY_API_KEY
-      // Sin esto, agy ignora la env var y pide login OAuth interactivo (rompe headless).
-      settingsFile: {
-        target: '/home/node/.gemini/antigravity-cli/settings.json',
-        content: JSON.stringify({ modelProvider: 'gemini' }),
-      },
+      mode: 'oauth-dir',
+      dirs: [{
+        target: '/home/node/.gemini/antigravity-cli',
+        copies: ['~/.delegate/agy-oauth/antigravity-oauth-token'],
+      }],
     },
     buildCmd({ promptText, model }) {
       return [

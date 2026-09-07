@@ -105,6 +105,19 @@ Esto crea `delegate.config.json` y `.delegate/sandbox.env` a partir de los templ
    delegate run claude "decime hola" --timeout 2
    ```
 
+### 2.5. (Opcional) Config global de usuario
+
+`~/.delegate/config.json` guarda defaults compartidos entre todos tus proyectos (`agents`, `dockerImage`, `defaultAgent`, etc.), así no repetís `delegate.config.json` en cada carpeta. Si el CWD no tiene `delegate.config.json` en ningún padre, delegate usa el global solo (con el CWD como raíz del repo). Si ambos existen, el de proyecto pisa al global — el merge es **shallow por agente completo**: si un proyecto define `agents.agy`, reemplaza entero al `agents.agy` global (no mergea `auth` campo a campo). Mismo formato que `delegate.config.json`:
+```json
+{
+  "dockerImage": "delegate-agent:latest",
+  "defaultAgent": "agy",
+  "agents": {
+    "agy": { "comment": "Auth = OAuth de cuenta Plus, cacheado en ~/.delegate/agy-oauth/." }
+  }
+}
+```
+
 ### 3. (Opcional) Skill para Claude Code
 
 Si usás Claude Code, copiá `templates/SKILL.md.example` a `.claude/skills/delegate/SKILL.md` de tu proyecto y ajustá las zonas prohibidas a tus reglas.
@@ -118,12 +131,26 @@ Idea: cada agente rinde en lo suyo. **Claude** para código; **Gemini/Antigravit
 | Agente | Comando | Rol | Estado | Auth por defecto |
 |---|---|---|---|---|
 | **Claude Code** | `delegate run claude "..."` | código | ✅ estable | OAuth `~/.claude/.credentials.json` o `ANTHROPIC_API_KEY` |
-| **Antigravity CLI** (`agy`) | `delegate run agy "..."` | creativo/research | 🟡 implementado, a validar live | **API key** `GEMINI_API_KEY` (AI Studio) o `ANTIGRAVITY_API_KEY` |
+| **Antigravity CLI** (`agy`) | `delegate run agy "..."` | creativo/research | ✅ estable | OAuth cuenta Plus, cacheado en `~/.delegate/agy-oauth/` |
 | **Gemini CLI** | `delegate run gemini "..."` | legacy | ⛔ Google lo **retira 2026-06-18** | OAuth `~/.gemini` |
 
 El default está en `defaultAgent` del config. Pineá modelo con `--model` o en `config.agents.<agente>.model`.
 
-**Nota sobre `agy` (headless):** su modo `-p` descarta stdout cuando no hay TTY, así que el adapter lo envuelve con `unbuffer` (PTY) y captura texto plano sanitizado de ANSI. La auth headless es por **API key** (no OAuth): seteá `GEMINI_API_KEY` en tu env y delegate la inyecta al container sin persistirla. El binario `agy` se instala en la imagen vía el instalador oficial de Google (ver Dockerfile).
+**Nota sobre `agy` (headless):** su modo `-p` descarta stdout cuando no hay TTY, así que el adapter lo envuelve con `unbuffer` (PTY) y captura texto plano sanitizado de ANSI. El binario `agy` se instala en la imagen vía el instalador oficial de Google (ver Dockerfile).
+
+**Auth de `agy` — por qué es OAuth y no API key:** `agy` guarda su sesión en el keyring del SO (D-Bus/Secret Service), que el container sandbox no tiene. Sin keyring, `agy` cae solo a **file storage** para el token — por eso alcanza con montarle ese archivo (`oauth-dir`, igual patrón que Claude/Codex), sin exponer ninguna key.
+
+**No uses `GEMINI_API_KEY` (AI Studio) para esto**: ese camino pega contra el Gemini Developer API público (`generativelanguage.googleapis.com`), con cuota free-tier **propia y separada** de tu cuenta de Antigravity — ahí `gemini-3.1-pro` tiene `limit: 0` (no es "se agotó", nunca tuvo cupo en el free tier). El OAuth de cuenta Plus, en cambio, pega contra el backend propio de Antigravity (`daily-cloudcode-pa.googleapis.com`) y usa la cuota que ves en el CLI interactivo.
+
+**Login inicial de `agy` (una sola vez, interactivo, en tu propia terminal — no por delegate):**
+```bash
+mkdir -p ~/.delegate/agy-oauth
+docker run --rm -it \
+  -v ~/.delegate/agy-oauth:/home/node/.gemini/antigravity-cli \
+  -u node delegate-agent:latest \
+  agy -p "ok" --dangerously-skip-permissions
+```
+Te tira una URL de Google, la abrís, logueás con tu cuenta Plus, pegás el código que te devuelve **en esa misma terminal** (la ventana de esa auth es de ~60s — por eso tiene que ser tu terminal directa, no un relay). Si sale bien, queda `~/.delegate/agy-oauth/antigravity-oauth-token` — el adapter lo monta en cada job de ahí en más. El token se refresca solo; si vence, repetís este paso.
 
 ## Uso
 
@@ -276,6 +303,14 @@ delegate-agent/                  # este repo (el tool)
 | `network` | Sin internet o API Gemini caída | Verificar conectividad. |
 | `auth` | OAuth de `~/.gemini/` venció | Correr `gemini` interactivo en host para refrescar; el próximo job copia el oauth nuevo. |
 | `unknown` con `tokens=0`, `exit=1` | Gemini-CLI murió sin emitir `result`. | Ver `meta.stderr_tail` y `transcript.jsonl`. |
+
+### `agy` pide login OAuth interactivo dentro del job (timeoutea)
+
+Significa que `~/.delegate/agy-oauth/antigravity-oauth-token` no existe o venció. Repetí el login inicial (ver sección de Agentes más arriba) — tiene que ser en tu terminal, un relay (otro proceso pegando el código por vos) pierde contra la ventana de ~60s que da el CLI.
+
+### `agy` responde `429 RESOURCE_EXHAUSTED` / `limit: 0`
+
+Estás pegándole al Gemini Developer API público con una `GEMINI_API_KEY` de AI Studio, no a tu cuenta Plus. Revisá que `agents.agy.auth` no tenga un override `mode: api-key` en ningún `delegate.config.json` (proyecto) ni en `~/.delegate/config.json` (global) — el default del adapter ya es `oauth-dir`, un override en cualquiera de los dos configs lo pisa entero (ver Config global de usuario).
 
 ### Otros problemas conocidos
 
